@@ -1,0 +1,7 @@
+{
+  "name": "youth-lodging",
+  "private": true,
+  "scripts": {
+    "test": "python3 -m unittest discover -v && node test_service.js"
+  }
+}
