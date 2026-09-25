@@ -61,6 +61,14 @@ class Api:
             ("GET", ("tickets",)): self._list_tickets,
             ("POST", ("tickets", "*", "decisions")): self._decide_ticket,
             ("GET", ("entitlements", "*")): self._entitlement,
+            ("POST", ("waitlist",)): self._register_waitlist,
+            ("GET", ("waitlist",)): self._waitlist_queue,
+            ("GET", ("waitlist", "mine")): self._waitlist_mine,
+            ("POST", ("waitlist", "expirations")): self._expire_waitlists,
+            ("GET", ("waitlist", "*")): self._get_waitlist,
+            ("POST", ("waitlist", "*", "confirm")): self._confirm_waitlist,
+            ("POST", ("waitlist", "*", "decline")): self._decline_waitlist,
+            ("POST", ("waitlist", "*", "cancel")): self._cancel_waitlist,
             ("GET", ("requests",)): self._list_requests,
             ("GET", ("requests", "*")): self._get_request,
             ("POST", ("requests", "*", "messages")): self._handle_request,
@@ -123,6 +131,49 @@ class Api:
         if actor.role == "applicant" and actor.id != applicant_id:
             raise PermissionError("只能查看本人权益")
         return 200, self.system.entitlement(applicant_id)
+
+    # ------------------------------------------------------------ 候补队列
+
+    def _register_waitlist(self, actor, segs, query, body):
+        for field in ("app_id", "start", "end"):
+            if not body.get(field):
+                raise ValidationError(f"缺少 {field}")
+        entry = self.system.register_waitlist(
+            actor, body["app_id"], body["start"], body["end"],
+            body.get("preferred_hotels") or [],
+            urgency=body.get("urgency", "normal"),
+            respond_by=body.get("respond_by"))
+        return 201, self.system.waitlist_entry_view(actor, entry.id)
+
+    def _waitlist_queue(self, actor, segs, query, body):
+        return 200, self.system.waitlist_queue_view(
+            actor, status=query.get("status"), hotel_code=query.get("hotel"),
+            date=query.get("date"))
+
+    def _waitlist_mine(self, actor, segs, query, body):
+        return 200, self.system.waitlist_mine(actor)
+
+    def _get_waitlist(self, actor, segs, query, body):
+        return 200, self.system.waitlist_entry_view(actor, segs[1])
+
+    def _confirm_waitlist(self, actor, segs, query, body):
+        result = self.system.confirm_waitlist(actor, segs[1], body.get("token"))
+        payload = {"waitlist_id": result["waitlist_id"],
+                   "status": result["status"], "idempotent": result["idempotent"]}
+        if result.get("allocation") is not None:
+            payload["allocation"] = allocation_dict(result["allocation"])
+        return 200, payload
+
+    def _decline_waitlist(self, actor, segs, query, body):
+        self.system.decline_waitlist(actor, segs[1], body.get("reason", ""))
+        return 200, self.system.waitlist_entry_view(actor, segs[1])
+
+    def _cancel_waitlist(self, actor, segs, query, body):
+        self.system.cancel_waitlist(actor, segs[1], body.get("reason", ""))
+        return 200, self.system.waitlist_entry_view(actor, segs[1])
+
+    def _expire_waitlists(self, actor, segs, query, body):
+        return 200, self.system.expire_waitlists(actor, body.get("at"))
 
     def _list_tickets(self, actor, segs, query, body):
         status = query.get("status")

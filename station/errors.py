@@ -59,6 +59,13 @@ class BookingConflictError(DomainError):
     http_status = 409
 
 
+class WaitlistConflictError(DomainError):
+    """候补操作冲突：重复登记、资格/冻结/工单/住宿冲突、保留过期或令牌失效。"""
+
+    code = "WAITLIST_CONFLICT"
+    http_status = 409
+
+
 class NotFoundError(DomainError):
     code = "NOT_FOUND"
     http_status = 404

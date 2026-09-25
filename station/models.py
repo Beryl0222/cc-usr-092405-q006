@@ -1,6 +1,11 @@
 """领域实体与序列化。全部使用日历日字符串持久化，便于接口直接输出。"""
 
+import uuid
 from dataclasses import dataclass, field, asdict
+
+
+def new_id(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 # 申请状态
 APP_SUBMITTED = "submitted"      # 已提交待核验
@@ -41,6 +46,23 @@ TICKET_REJECTED = "rejected"
 SRC_DOOR_LOCK = "door_lock"
 SRC_FRONT_DESK = "front_desk"
 SRC_SYSTEM = "system"
+
+# 候补条目状态
+WAIT_QUEUED = "queued"          # 排队中，等待房态恢复
+WAIT_OFFERED = "offered"        # 已出暂时保留方案，等待申请人确认
+WAIT_CONFIRMED = "confirmed"    # 已确认（占房已落地，候补闭合）
+WAIT_DECLINED = "declined"      # 申请人主动拒绝保留
+WAIT_EXPIRED = "expired"        # 最晚确认时间超时，保留已释放
+WAIT_CANCELLED = "cancelled"    # 申请人撤回候补
+WAIT_BLOCKED = "blocked"        # 出现资格/冻结/工单/住宿冲突，暂不参与晋位
+
+# 候补终态（不再参与队列推进）
+WAIT_FINAL = {WAIT_CONFIRMED, WAIT_DECLINED, WAIT_EXPIRED, WAIT_CANCELLED}
+# 紧急程度（值越大越优先；排序时在资格时间之后、申请顺序之前使用）
+URGENCY_NORMAL = "normal"
+URGENCY_RECRUIT = "recruit"            # 大型招聘活动期间
+URGENCY_ARRIVING = "arriving_today"    # 当日抵城、车次/活动已临近
+URGENCY_ORDER = {URGENCY_NORMAL: 0, URGENCY_RECRUIT: 1, URGENCY_ARRIVING: 2}
 
 
 @dataclass
@@ -178,3 +200,43 @@ class Settlement:
     lines: list = field(default_factory=list)
     total_subsidy: float = 0.0
     total_nights: int = 0
+
+
+@dataclass
+class WaitlistEntry:
+    """候补队列条目。
+
+    排序口径（晋位顺序）在登记时固化为 rank_key 并以 reasons 解释：
+    资格决定时间（越早越优先）→ 紧急程度 → 申请顺序（全局自增序号）。
+    房态恢复后至多生成一个暂时保留方案（offer）；确认/超时/拒绝都在同一把
+    锁内原子释放床位索引并推动下一位。
+    """
+
+    id: str
+    app_id: str
+    applicant_id: str
+    start: str                       # 连续日期起（含）
+    end: str                         # 连续日期止（含）
+    preferred_hotels: list           # 可接受酒店编号（按偏好排序）
+    register_seq: int                # 全局申请顺序，同条件下先登记先得
+    decided_on: str                  # 资格决定时间（资格快照日；申诉通过则取裁决日）
+    urgency: str = URGENCY_NORMAL
+    rank_key: list = field(default_factory=list)      # 固化的晋位排序键
+    rank_reasons: dict = field(default_factory=dict)  # 可解释队列的排序依据
+    status: str = WAIT_QUEUED
+    # 暂时保留方案（queued 时为 None）
+    offer_hotel: object = None
+    offer_bed: object = None
+    offer_nights: list = field(default_factory=list)
+    offered_at: object = None
+    confirm_deadline: object = None  # 最晚确认时间（绝对时间，ISO）
+    offer_token: object = None       # 保留方案版本号：每次出队生成新令牌
+    allocation_id: object = None     # 确认后落地的占房
+    # 阻塞原因（blocked 状态）：existing_stay / frozen / open_ticket / quota / policy
+    blocked_reason: object = None
+    blocked_detail: dict = field(default_factory=dict)
+    created_at: object = None
+    updated_at: object = None
+    history: list = field(default_factory=list)       # 状态流转留痕
+    # 最近一次晋位为何没匹配上（解释"为什么还没轮到我"）
+    last_skip_reason: object = None

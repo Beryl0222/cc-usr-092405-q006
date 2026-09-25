@@ -7,7 +7,7 @@
 ```bash
 python3 service.py --check     # 基础检查（28 处酒店、床位、政策版本）
 python3 service.py --port 8000 # 启动 HTTP 服务
-npm test                       # 运行 59 项领域与 HTTP 测试，再执行健康契约
+npm test                       # 运行 89 项领域与 HTTP 测试，再执行健康契约
 python3 -m compileall -q .     # 编译检查全部 Python 模块
 ```
 
@@ -32,6 +32,21 @@ python3 -m compileall -q .     # 编译检查全部 Python 模块
 **人工例外**：爽约、超期、紧急延住、离店未归还、事件冲突全部生成挂到值班长名下
 的复核工单（`GET /api/tickets`），值班长裁决留名、每单只裁一次。争议夜冻结期间
 床位不可二次售出，也不参与清算。
+
+**候补队列**：申请人为一段连续日期登记可接受酒店与最晚确认时间（`POST
+/api/waitlist`）。晋位顺序在登记时固化为"资格决定时间（越早越优先）→ 紧急程度
+（`normal`/`recruit`/`arriving_today`）→ 全局申请顺序"，排序依据随每条候补输出
+（`rank_reasons`、`queue_position`），队列可解释。候补与既有住宿、争议冻结夜、
+未裁决工单、权益余额互斥，登记即拦截；排队中新出现的冲突把条目转入 `blocked`，
+冲突消除后带原顺序归队。房态恢复后按固化顺序晋位，每位候补至多得到一个暂时
+保留方案（独立的按夜持有索引，**不扣补贴天数**、不可被正式占房抢走）；确认时
+才在同一把锁内落地正式占房；超时、拒绝、撤回原子释放持有夜并立即推动下一位。
+离线重复确认幂等返回同一占房，不会多扣权益。保留截止时间是登记时确定的绝对
+时刻，跨日截止扫描（`POST /api/waitlist/expirations`，可注入 `at`）只让到点的
+保留失效，不重算期限；系统快照/恢复（`snapshot_state`/`restore_state`）后晋位
+顺序与保留期限均保持不变。工作人员通过 `GET /api/waitlist`（可按 `status`/
+`hotel`/`date` 过滤；前台自动限本店）查看全员队列，申请人通过 `GET
+/api/waitlist/mine` 只看本人。
 
 **财政清算**：只按实际合规入住夜清算，每晚的房价与政策补贴单价在确认占房时锁定，
 之后房价/政策变化不影响已确认补贴（`GET /api/hotels/{code}/subsidy-basis?date=`）。
@@ -65,6 +80,14 @@ python3 -m compileall -q .     # 编译检查全部 Python 模块
 | GET | `/api/tickets?status=open` | 人工复核工单 |
 | POST | `/api/tickets/{id}/decisions` | 值班长裁决 |
 | GET | `/api/entitlements/{applicant}` | 剩余权益与逐日消耗 |
+| POST | `/api/waitlist` | 候补登记（连续日期+可接受酒店+最晚确认时间） |
+| GET | `/api/waitlist?status=&hotel=&date=` | 工作人员候补队列（前台限本店） |
+| GET | `/api/waitlist/mine` | 申请人本人候补（含位次与排序依据） |
+| GET | `/api/waitlist/{id}` | 单条候补状态与保留方案 |
+| POST | `/api/waitlist/{id}/confirm` | 确认保留（重复确认幂等） |
+| POST | `/api/waitlist/{id}/decline` | 拒绝保留（释放并晋位下一位） |
+| POST | `/api/waitlist/{id}/cancel` | 撤回候补 |
+| POST | `/api/waitlist/expirations` | 跨日截止扫描（自动化可注入 `at`） |
 | POST | `/api/applications/{id}/requests` | 服务诉求（企业参访等） |
 
 错误体稳定为 `{"error": {"code", "message", ...}}`；资格临界、紧急延住等转人工的

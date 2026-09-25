@@ -21,6 +21,7 @@ from .errors import (BookingConflictError, DomainError, NotFoundError,
                      ReviewRequiredError, RoomUnavailableError, ValidationError)
 from .models import *
 from .timeutil import daterange, iso, now_cst, parse_date, parse_dt
+from .waitlist import WaitlistMixin
 
 # 仍在占用（消耗权益、阻挡他人订房）的夜状态
 OCCUPYING = {NIGHT_HELD, NIGHT_STAYED, NIGHT_AWAY, NIGHT_OVERSTAY, NIGHT_BLOCKED}
@@ -34,7 +35,7 @@ def _new_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-class LodgingSystem:
+class LodgingSystem(WaitlistMixin):
     def __init__(self, policies, directory, rates, now_fn=None):
         self.policies = policies
         self.directory = directory
@@ -56,6 +57,13 @@ class LodgingSystem:
         self._person_night = {}
         # 语义去重指纹 -> event_id
         self._fingerprints = {}
+        # 候补队列：entry_id -> WaitlistEntry；register_seq 全局自增保证申请顺序
+        self.waitlist = {}
+        self._waitlist_seq = 0
+        # (hotel, bed, iso_day) -> waitlist_entry_id：暂时保留的按夜持有索引，
+        # 与 _bed_night 共用排他性但不消耗权益
+        self._held_offers = {}
+        self._pumping = False
 
     # ------------------------------------------------------------------ 用户
 
@@ -264,6 +272,7 @@ class LodgingSystem:
                 released.append(day)
                 self._release_indices(alloc, day)
             self._trim_span(alloc)
+            self._pump_waitlist()   # 房态恢复：按固化顺序晋位
             return {"allocation_id": alloc.id, "released": released}
 
     def cancel_booking(self, actor: Actor, allocation_id):
@@ -285,6 +294,7 @@ class LodgingSystem:
                     released.append(day)
                     self._release_indices(alloc, day)
             self._trim_span(alloc)
+            self._pump_waitlist()   # 整单退订释放：按固化顺序晋位
             return {"allocation_id": alloc.id, "cancelled": True, "released": released}
 
     # ------------------------------------------------------------- 跨站调剂
@@ -404,6 +414,7 @@ class LodgingSystem:
                 raise
             self.allocations[dst.id] = dst
             self._trim_span(src)
+            self._pump_waitlist()   # 旧店夜已释放：按固化顺序晋位
             return {"closed_partial": src.id, "released": released,
                     "new_allocation": dst, "late_nights_ticket": created_ticket.id if created_ticket else None}
 
@@ -413,13 +424,17 @@ class LodgingSystem:
         """接收门锁/前台事件（含断网补传）。重复事件幂等识别，矛盾不静默放行。"""
         self._require_role(actor, "hotel_front", "verifier", "duty_manager")
         with self.lock:
-            return self._safe_ingest(payload, actor)
+            result = self._safe_ingest(payload, actor)
+            self._pump_waitlist()   # 退房等事件可能释放床位
+            return result
 
     def ingest_events(self, actor: Actor, payloads):
         """批量补传：整批在锁内顺序处理，逐条给出落地结果。"""
         self._require_role(actor, "hotel_front", "verifier", "duty_manager")
         with self.lock:
-            return [self._safe_ingest(p, actor) for p in payloads]
+            results = [self._safe_ingest(p, actor) for p in payloads]
+            self._pump_waitlist()
+            return results
 
     def _safe_ingest(self, payload, actor):
         try:
@@ -697,12 +712,16 @@ class LodgingSystem:
                                 (alloc.hotel_code, alloc.bed_key, d))
                             person_owner = self._person_night.get(
                                 (alloc.applicant_id, d))
+                            held_by = self._held_offers.get(
+                                (alloc.hotel_code, alloc.bed_key, d))
                             if (bed_owner and bed_owner != alloc.id) or \
-                               (person_owner and person_owner != alloc.id):
-                                # 上一张超期工单被驳回后床位已售出/本人已另订：
+                               (person_owner and person_owner != alloc.id) or \
+                               held_by:
+                                # 上一张超期工单被驳回后床位已售出/被候补保留/本人已另订：
                                 # 绝不覆盖唯一索引，登记冲突交值班长现场处置
                                 conflicts.append({"date": d, "bed_owner": bed_owner,
-                                                  "person_owner": person_owner})
+                                                  "person_owner": person_owner,
+                                                  "held_by_waitlist": held_by})
                                 continue
                             alloc.nights[d] = NightLine(
                                 date=d, state=NIGHT_OVERSTAY, billable=False,
@@ -809,6 +828,7 @@ class LodgingSystem:
             handler(ticket, app, alloc, decision, note, billable)
             if app:
                 self._refresh_app_status(app)
+            self._pump_waitlist()   # 裁决可能释放冻结/超期夜
             return ticket
 
     def _decide_eligibility_appeal(self, ticket, app, alloc, decision, note, billable):
@@ -1073,17 +1093,21 @@ class LodgingSystem:
                     "night_state": line.state if line else None,
                     "billable": line.billable if line else None,
                     "applicant_id": alloc.applicant_id if alloc else None,
+                    # 候补暂时保留：工作人员可见保留来源，但不属于正式占房
+                    "held_by_waitlist": self._held_offers.get(
+                        (hotel_code, bed.key, day)),
                 })
             return {"hotel_code": hotel_code, "date": day, "beds": rows}
 
     def availability(self, hotel_code, day):
-        """任意角色可查的空房数（不含占用人信息）。"""
+        """任意角色可查的空房数（不含占用人信息）；候补暂时保留同样不计空房。"""
         day = iso(parse_date(day))
         with self.lock:
             hotel = self.directory.get(hotel_code)
             free = sum(1 for b in hotel.beds
                        if b.status != BED_BLOCKED
-                       and (hotel_code, b.key, day) not in self._bed_night)
+                       and (hotel_code, b.key, day) not in self._bed_night
+                       and (hotel_code, b.key, day) not in self._held_offers)
             return {"hotel_code": hotel_code, "date": day,
                     "total_beds": hotel.bed_count(), "free_beds": free}
 
@@ -1113,6 +1137,65 @@ class LodgingSystem:
                 })
             return {"hotel_code": hotel_code, "date": day, "lines": basis}
 
+    # ------------------------------------------------------------- 快照与恢复
+
+    def snapshot_state(self):
+        """导出全部业务状态为可 JSON 化字典（重启/迁移边界）。
+
+        政策、酒店目录、房价与时钟属于外部依赖，不进快照——恢复时重新注入；
+        候补的晋位顺序（rank_key/register_seq）与保留截止时间（confirm_deadline）
+        随业务状态原样持久化。
+        """
+        from dataclasses import asdict
+        with self.lock:
+            return {
+                "duty_manager_id": self.duty_manager_id,
+                "users": {k: asdict(v) for k, v in self.users.items()},
+                "applications": {k: asdict(v) for k, v in self.applications.items()},
+                "allocations": {k: asdict(v) for k, v in self.allocations.items()},
+                "events": {k: asdict(v) for k, v in self.events.items()},
+                "tickets": {k: asdict(v) for k, v in self.tickets.items()},
+                "requests": {k: asdict(v) for k, v in self.requests.items()},
+                "settlements": {k: asdict(v) for k, v in self.settlements.items()},
+                "bed_night": [[*k, v] for k, v in self._bed_night.items()],
+                "person_night": [[*k, v] for k, v in self._person_night.items()],
+                "fingerprints": [[*k, v] for k, v in self._fingerprints.items()],
+                "waitlist": self.export_waitlist(),
+            }
+
+    def restore_state(self, data):
+        """从快照恢复业务状态；顺序索引与保留期限不重算。"""
+        from .models import (Actor, Application, Allocation, EventRecord,
+                             NightLine, ReviewTicket, ServiceRequest, Settlement)
+        with self.lock:
+            self.users = {k: Actor(**v) for k, v in data.get("users", {}).items()}
+            self.duty_manager_id = data.get("duty_manager_id")
+            self.applications = {k: Application(**v)
+                                 for k, v in data.get("applications", {}).items()}
+            self.allocations = {}
+            for k, raw in data.get("allocations", {}).items():
+                raw = dict(raw)
+                raw["nights"] = {d: NightLine(**line)
+                                 for d, line in (raw.get("nights") or {}).items()}
+                self.allocations[k] = Allocation(**raw)
+            self.events = {k: EventRecord(**v)
+                           for k, v in data.get("events", {}).items()}
+            self.tickets = {k: ReviewTicket(**v)
+                            for k, v in data.get("tickets", {}).items()}
+            self.requests = {k: ServiceRequest(**v)
+                             for k, v in data.get("requests", {}).items()}
+            self.settlements = {k: Settlement(**v)
+                                for k, v in data.get("settlements", {}).items()}
+            self._bed_night = {(h, b, d): v
+                               for h, b, d, v in data.get("bed_night", [])}
+            self._person_night = {(p, d): v
+                                  for p, d, v in data.get("person_night", [])}
+            self._fingerprints = {tuple(k[:-1]): k[-1]
+                                  for k in data.get("fingerprints", [])}
+            if "waitlist" in data:
+                self.import_waitlist(data["waitlist"])
+        return self
+
     # ------------------------------------------------------------------ 内部
 
     def _load_app(self, app_id):
@@ -1139,7 +1222,10 @@ class LodgingSystem:
         return [a for a in self.allocations.values() if a.applicant_id == applicant_id]
 
     def _bed_available(self, hotel_code, bed_key, dates):
-        return all((hotel_code, bed_key, iso(d)) not in self._bed_night for d in dates)
+        """正式占房视角的可用性：唯一占用索引与候补持有索引都为空才可用。"""
+        return all((hotel_code, bed_key, iso(d)) not in self._bed_night
+                   and (hotel_code, bed_key, iso(d)) not in self._held_offers
+                   for d in dates)
 
     def _person_overlap(self, applicant_id, dates, exclude=None):
         return [iso(d) for d in dates
