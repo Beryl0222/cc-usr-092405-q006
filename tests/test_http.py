@@ -154,6 +154,86 @@ class HttpApiTest(HttpTestBase):
         self.assertEqual(payload["error"]["code"], "REVIEW_REQUIRED")
         self.assertTrue(payload["error"]["ticket_id"])
 
+    def _eligible_applicant(self, uid, name):
+        from station.models import Actor
+        self.system.register_user(Actor(uid, "applicant", name))
+        status, app = self.call("POST", "/api/applications", actor=uid, body={
+            "material": {"name": name, "phone": "137", "id_card_masked": "110***",
+                         "household_type": "外地", "graduation_date": "2025-06-30",
+                         "degree": "本科", "purpose": "求职"}})
+        self.assertEqual(status, 201, app)
+        return app
+
+    def test_waitlist_advance_confirm_over_http(self):
+        # 占住 H02 唯一床位的人
+        holder = self._eligible_applicant("u_wh", "持房")
+        status, alloc = self.call("POST", f"/api/applications/{holder['id']}/bookings",
+                                  actor="u_wh",
+                                  body={"hotel_code": "H02", "start": "2026-09-23",
+                                        "end": "2026-09-25"})
+        self.assertEqual(status, 201, alloc)
+
+        # 两位候补
+        w1 = self._eligible_applicant("u_w1", "候补甲")
+        w2 = self._eligible_applicant("u_w2", "候补乙")
+        for uid, app in (("u_w1", w1), ("u_w2", w2)):
+            status, entry = self.call("POST", f"/api/applications/{app['id']}/waitlist",
+                                      actor=uid, body={
+                "start": "2026-09-23", "end": "2026-09-25", "hotels": ["H02"],
+                "latest_confirm_at": "2026-10-30T00:00:00+08:00"})
+            self.assertEqual(status, 201, entry)
+
+        # 工作人员看到队列与解释
+        status, queue = self.call("GET", "/api/waitlist", actor="u_verifier")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(queue["entries"]), 2)
+        self.assertEqual(queue["order_rule"][0], "urgency_score desc")
+
+        # 申请人只看到本人
+        status, mine = self.call("GET", "/api/waitlist/mine", actor="u_w1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(mine["entries"]), 1)
+        self.assertIsNone(mine["entries"][0]["offer"])
+
+        # 持房人退订 → 自动晋位第一位
+        status, _ = self.call("POST", f"/api/allocations/{alloc['id']}/cancel",
+                              actor="u_wh", body={})
+        self.assertEqual(status, 200)
+        status, mine1 = self.call("GET", "/api/waitlist/mine", actor="u_w1")
+        self.assertEqual(mine1["entries"][0]["status"], "offered")
+        offer = mine1["entries"][0]["offer"]
+        self.assertTrue(offer["expires_at"])
+
+        # 确认（带幂等令牌），重复确认不重复扣权益
+        entry_id = mine1["entries"][0]["id"]
+        status, confirmed = self.call("POST", f"/api/waitlist/{entry_id}/confirm",
+                                      actor="u_w1", body={"request_id": "http-r-1"})
+        self.assertEqual(status, 200, confirmed)
+        self.assertFalse(confirmed["idempotent"])
+        self.assertFalse(confirmed["allocation"]["provisional"])
+        status, again = self.call("POST", f"/api/waitlist/{entry_id}/confirm",
+                                  actor="u_w1", body={"request_id": "http-r-1"})
+        self.assertTrue(again["idempotent"])
+        status, ent = self.call("GET", "/api/entitlements/u_w1", actor="u_w1")
+        self.assertEqual(ent["used_nights"], 3)
+
+        # 第二位仍 waiting
+        status, mine2 = self.call("GET", "/api/waitlist/mine", actor="u_w2")
+        self.assertEqual(mine2["entries"][0]["status"], "waiting")
+
+    def test_waitlist_permissions(self):
+        # 值班长/核验可看工作人员全量队列
+        status, _ = self.call("GET", "/api/waitlist", actor="u_duty")
+        self.assertEqual(status, 200)
+        status, _ = self.call("GET", "/api/waitlist", actor="u_verifier")
+        self.assertEqual(status, 200)
+        # 申请人不能看工作人员全量队列
+        from station.models import Actor
+        self.system.register_user(Actor("u_plain", "applicant", "普通人"))
+        status, payload = self.call("GET", "/api/waitlist", actor="u_plain")
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "PERMISSION_DENIED")
+
 
 if __name__ == "__main__":
     unittest.main()

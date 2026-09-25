@@ -6,7 +6,7 @@
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, NotFoundError, PermissionError, ValidationError
-from .serialization import (allocation_dict, application_dict, request_dict,
+from .serialization import (allocation_dict, application_dict, dto, request_dict,
                             settlement_dict, ticket_dict)
 
 
@@ -55,6 +55,15 @@ class Api:
             ("POST", ("allocations", "*", "emergency-extension")): self._emergency_extension,
             ("POST", ("allocations", "*", "settle")): self._settle,
             ("GET", ("allocations", "*")): self._get_allocation,
+            ("POST", ("applications", "*", "waitlist")): self._register_waitlist,
+            ("GET", ("waitlist",)): self._waitlist_queue,
+            ("GET", ("waitlist", "mine")): self._waitlist_mine,
+            ("POST", ("waitlist", "advance")): self._waitlist_advance,
+            ("POST", ("waitlist", "expire")): self._waitlist_expire,
+            ("GET", ("waitlist", "*")): self._waitlist_entry,
+            ("POST", ("waitlist", "*", "confirm")): self._waitlist_confirm,
+            ("POST", ("waitlist", "*", "reject")): self._waitlist_reject,
+            ("POST", ("waitlist", "*", "cancel")): self._waitlist_cancel,
             ("POST", ("events",)): self._ingest_event,
             ("POST", ("events", "batch")): self._ingest_events,
             ("POST", ("review-scans",)): self._review_scan,
@@ -66,12 +75,17 @@ class Api:
             ("POST", ("requests", "*", "messages")): self._handle_request,
             ("POST", ("requests", "*", "close")): self._close_request,
         }
+        matches = []
         for (m, pattern), fn in table.items():
             if m != method or len(pattern) != len(segs):
                 continue
             if all(p == "*" or p == s for p, s in zip(pattern, segs)):
-                return fn
-        return None
+                matches.append((pattern.count("*"), fn))
+        if not matches:
+            return None
+        # 字面量片段优先于通配符（如 waitlist/mine 优先于 waitlist/*）
+        matches.sort(key=lambda item: item[0])
+        return matches[0][1]
 
     # ------------------------------------------------------------ 查询
 
@@ -223,6 +237,58 @@ class Api:
 
     def _close_request(self, actor, segs, query, body):
         return 200, request_dict(self.system.close_request(actor, segs[1]))
+
+    # ------------------------------------------------------------ 候补队列
+
+    def _register_waitlist(self, actor, segs, query, body):
+        entry = self.system.register_waitlist(
+            actor, segs[1], body["start"], body["end"], body.get("hotels"),
+            body.get("latest_confirm_at"), body.get("hold_minutes"),
+            body.get("bed_key"), body.get("note", ""))
+        return 201, self.system._entry_view(entry)
+
+    def _waitlist_queue(self, actor, segs, query, body):
+        status = query.get("status", "waiting")
+        payload = self.system.waitlist_queue(
+            actor, query.get("hotel"), status,
+            include_offered=query.get("include_offered", "1") != "0")
+        return 200, payload
+
+    def _waitlist_mine(self, actor, segs, query, body):
+        return 200, self.system.applicant_waitlist(actor)
+
+    def _waitlist_entry(self, actor, segs, query, body):
+        entry = self.system.get_waitlist_entry(segs[1])
+        if actor.role == "applicant" and actor.id != entry.applicant_id:
+            raise PermissionError("只能查看本人候补")
+        view = self.system._entry_view(entry)
+        if entry.status == "offered" and entry.offer_id:
+            view["offer"] = self.system._offer_view(self.system.offers[entry.offer_id])
+        return 200, view
+
+    def _waitlist_advance(self, actor, segs, query, body):
+        limit = body.get("limit", 1)
+        return 200, self.system.advance_waitlist(
+            actor, body.get("hotel_code"), body.get("on_date"),
+            int(limit) if limit is not None else None)
+
+    def _waitlist_expire(self, actor, segs, query, body):
+        return 200, self.system.expire_waitlist(actor, body.get("offer_id"))
+
+    def _waitlist_confirm(self, actor, segs, query, body):
+        result = self.system.confirm_waitlist_offer(
+            actor, entry_id=segs[1], request_id=body.get("request_id"))
+        result["offer"] = result["offer"]
+        result["allocation"] = allocation_dict(result["allocation"])
+        return 200, result
+
+    def _waitlist_reject(self, actor, segs, query, body):
+        return 200, dto(self.system.reject_waitlist_offer(
+            actor, entry_id=segs[1], note=body.get("note", "申请人拒绝")))
+
+    def _waitlist_cancel(self, actor, segs, query, body):
+        return 200, dto(self.system.cancel_waitlist(
+            actor, segs[1], body.get("note", "申请人撤下")))
 
 
 def error_payload(exc):

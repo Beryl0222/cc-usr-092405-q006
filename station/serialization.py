@@ -51,6 +51,12 @@ def allocation_dict(alloc: "models.Allocation", include_nights=True):
         "check_in_at": dto(alloc.check_in_at),
         "check_out_at": dto(alloc.check_out_at),
         "settlement_id": alloc.settlement_id,
+        "provisional": alloc.provisional,
+        "waitlist_entry_id": alloc.waitlist_entry_id,
+        "offer_id": alloc.offer_id,
+        "offered_at": dto(alloc.offered_at),
+        "offer_expires_at": dto(alloc.offer_expires_at),
+        "confirmed_at": dto(alloc.confirmed_at),
     }
     if include_nights:
         out["nights"] = {d: line.to_dict() for d, line in sorted(alloc.nights.items())}

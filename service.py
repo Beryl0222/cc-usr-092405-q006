@@ -9,6 +9,7 @@ SERVICE_NAME = "青年驿站运营"
 
 _SYSTEM = None
 _API = None
+_RESTORE_PATH = None
 
 
 def health_payload():
@@ -22,7 +23,12 @@ def get_system():
     if _SYSTEM is None:
         from station.seed import build_seed_system
         from station.http_api import Api
+        from station.persistence import restore_system
         _SYSTEM = build_seed_system()
+        if _RESTORE_PATH:
+            import json
+            with open(_RESTORE_PATH, encoding="utf-8") as fh:
+                restore_system(_SYSTEM, json.load(fh))
         _API = Api(_SYSTEM)
     return _SYSTEM, _API
 
@@ -89,7 +95,25 @@ def main():
     parser = argparse.ArgumentParser(description=SERVICE_NAME)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--now", help="注入固定时钟（ISO 时间），用于自动化场景")
+    parser.add_argument("--snapshot", help="启动后把系统快照写入该 JSON 路径并退出")
+    parser.add_argument("--restore", help="从该 JSON 快照恢复后再启动")
     args = parser.parse_args()
+
+    global _RESTORE_PATH
+    _RESTORE_PATH = args.restore
+
+    if args.now:
+        from station.timeutil import parse_dt
+        fixed = parse_dt(args.now)
+        from station import seed as seed_mod
+        _orig_build = seed_mod.build_seed_system
+
+        def build_with_clock(now_fn=None):  # noqa: ANN001
+            return _orig_build(now_fn or (lambda: fixed))
+
+        seed_mod.build_seed_system = build_with_clock
+
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
         system, _ = get_system()
@@ -97,6 +121,13 @@ def main():
         info = check_seed(system)
         print(f"基础检查通过：{info['hotels']} 处酒店、{info['beds']} 张床位、"
               f"政策版本 {','.join(info['policies'])}")
+        return
+
+    system, _ = get_system()
+    if args.snapshot:
+        from station.persistence import dump_json
+        dump_json(system, args.snapshot)
+        print(f"快照已写入 {args.snapshot}")
         return
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 

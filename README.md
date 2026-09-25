@@ -7,7 +7,10 @@
 ```bash
 python3 service.py --check     # 基础检查（28 处酒店、床位、政策版本）
 python3 service.py --port 8000 # 启动 HTTP 服务
-npm test                       # 运行 59 项领域与 HTTP 测试，再执行健康契约
+python3 service.py --now 2026-09-22T09:00:00+08:00  # 注入固定时钟
+python3 service.py --snapshot snap.json --now ...   # 写出系统快照后退出
+python3 service.py --restore snap.json --port 8000  # 从快照恢复后启动
+npm test                       # 运行领域与 HTTP 测试，再执行健康契约
 python3 -m compileall -q .     # 编译检查全部 Python 模块
 ```
 
@@ -41,6 +44,20 @@ python3 -m compileall -q .     # 编译检查全部 Python 模块
 团干部处理服务诉求时只能看到身份与参访意向等服务必需字段，期望薪资、简历、
 作品集等非必要信息一律 `***无权查看***`；前台与财政仅见身份最小集。
 
+**候补队列**：申请人可为一段连续日期登记可接受酒店与最晚确认时间
+（`POST /api/applications/{id}/waitlist`）。入队即校验资格与冲突——资格未过、
+与既有住宿重叠、存在申诉冻结夜或未裁决工单、与本人其他活跃候补重叠、权益不足
+一律拒绝（`WAITLIST_CONFLICT`），不先占位再静默跳过。队列按
+"紧急程度 → 资格决定时间 → 申请顺序"三级排序，排序依据在登记瞬间固化为
+`rank_basis`，跨日与重启都不改变晋位顺序。房态恢复（退订、撤回、退房释放、
+调剂截断、裁决释放）后在同一把锁内**只暂时保留一个匹配方案**：床位进入唯一
+房态索引但标记 `provisional`，工作人员与申请人各自看到队列状态与剩余确认时间。
+确认（支持幂等 `request_id`，离线重复确认不二次扣权益）转为正式占房；超时、
+拒绝、撤下都会**原子释放床位并顺延下一位**。暂时性保留期内不能入住、清算、
+调剂或延住，落在该床的事件转人工工单。保留期限记录为绝对时刻
+（`offer.expires_at`），重启不重新计时；`station/persistence.py` 的快照/恢复
+重建唯一索引，保证跨日截止点、并发退订并重启后晋位顺序与保留期限不变。
+
 ## HTTP 接口
 
 所有业务接口需要 `X-Actor-Id` 头（种子用户：`u_duty` 值班长、`u_verifier` 运营核验、
@@ -66,6 +83,15 @@ python3 -m compileall -q .     # 编译检查全部 Python 模块
 | POST | `/api/tickets/{id}/decisions` | 值班长裁决 |
 | GET | `/api/entitlements/{applicant}` | 剩余权益与逐日消耗 |
 | POST | `/api/applications/{id}/requests` | 服务诉求（企业参访等） |
+| POST | `/api/applications/{id}/waitlist` | 候补登记（连续日期/可接受酒店/最晚确认时间） |
+| GET | `/api/waitlist?hotel=&status=` | 工作人员队列（队位、紧急程度、排序解释、保留状态） |
+| GET | `/api/waitlist/mine` | 申请人本人候补（队位、方案、剩余确认秒数） |
+| GET | `/api/waitlist/{id}` | 单条候补（本人或工作人员） |
+| POST | `/api/waitlist/advance` | 手动推进晋位（房态恢复时也会自动触发） |
+| POST | `/api/waitlist/expire` | 超时扫描（或指定 offer_id 单条超时） |
+| POST | `/api/waitlist/{id}/confirm` | 确认保留方案（幂等 `request_id`） |
+| POST | `/api/waitlist/{id}/reject` | 拒绝方案（原子释放并顺延） |
+| POST | `/api/waitlist/{id}/cancel` | 撤下候补 |
 
 错误体稳定为 `{"error": {"code", "message", ...}}`；资格临界、紧急延住等转人工的
 场景返回 `202 + REVIEW_REQUIRED + ticket_id`。

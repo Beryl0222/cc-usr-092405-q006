@@ -18,7 +18,8 @@ from . import policy as policy_mod
 from .catalog import BED_BLOCKED
 from .errors import (BookingConflictError, DomainError, NotFoundError,
                      PermissionError, PolicyError, QuotaError,
-                     ReviewRequiredError, RoomUnavailableError, ValidationError)
+                     ReviewRequiredError, RoomUnavailableError, ValidationError,
+                     WaitlistConflictError, WaitlistStateError)
 from .models import *
 from .timeutil import daterange, iso, now_cst, parse_date, parse_dt
 
@@ -26,6 +27,9 @@ from .timeutil import daterange, iso, now_cst, parse_date, parse_dt
 OCCUPYING = {NIGHT_HELD, NIGHT_STAYED, NIGHT_AWAY, NIGHT_OVERSTAY, NIGHT_BLOCKED}
 # 同源语义事件在该窗口内视为同一件事（门锁与前台各自补传也能去重）
 SEMANTIC_DEDUP_MINUTES = 30
+
+# 候补保留方案默认保留时长（分钟）：晋位后申请人须在此时长内确认
+OFFER_HOLD_MINUTES = DEFAULT_OFFER_HOLD_MINUTES
 
 _EVENT_TYPES = {"check_in", "door_open", "temp_leave", "return", "check_out"}
 
@@ -50,6 +54,11 @@ class LodgingSystem:
         self.tickets = {}
         self.requests = {}
         self.settlements = {}
+        # 候补
+        self.waitlist = {}           # entry_id -> WaitlistEntry
+        self.offers = {}             # offer_id -> WaitlistOffer
+        self._waitlist_seq = 0       # 申请顺序（单调序号，重启后由快照恢复）
+        self._consumed_confirm_ids = set()  # 已消费的确认幂等令牌
         # (hotel, bed, iso_day) -> allocation_id
         self._bed_night = {}
         # (applicant_id, iso_day) -> allocation_id，防止跨店重复占房/重复报销
@@ -251,6 +260,10 @@ class LodgingSystem:
         with self.lock:
             alloc = self._load_alloc(allocation_id)
             self._require_owner_or_staff(actor, alloc)
+            if getattr(alloc, "provisional", False):
+                raise WaitlistStateError(
+                    "候补暂时性占房请通过确认/拒绝/超时流程处理",
+                    offer_id=alloc.offer_id)
             days = sorted({iso(parse_date(d)) for d in dates})
             released = []
             for day in days:
@@ -264,13 +277,20 @@ class LodgingSystem:
                 released.append(day)
                 self._release_indices(alloc, day)
             self._trim_span(alloc)
-            return {"allocation_id": alloc.id, "released": released}
+            result = {"allocation_id": alloc.id, "released": released}
+            if released:
+                # 房态恢复：原子推进候补（同锁，恰好一位晋位）
+                result["waitlist"] = self.advance_waitlist()
+            return result
 
     def cancel_booking(self, actor: Actor, allocation_id):
         """整单取消（仅限全部夜均未使用）。"""
         with self.lock:
             alloc = self._load_alloc(allocation_id)
             self._require_owner_or_staff(actor, alloc)
+            if getattr(alloc, "provisional", False):
+                raise WaitlistStateError(
+                    "候补暂时性占房请通过拒绝/超时流程释放", offer_id=alloc.offer_id)
             blocked = [d for d, l in alloc.nights.items() if l.state == NIGHT_BLOCKED]
             if blocked:
                 raise ValidationError("存在争议冻结夜，请先等待人工裁决", dates=blocked[:10])
@@ -285,7 +305,10 @@ class LodgingSystem:
                     released.append(day)
                     self._release_indices(alloc, day)
             self._trim_span(alloc)
-            return {"allocation_id": alloc.id, "cancelled": True, "released": released}
+            result = {"allocation_id": alloc.id, "cancelled": True, "released": released}
+            if released:
+                result["waitlist"] = self.advance_waitlist()
+            return result
 
     # ------------------------------------------------------------- 跨站调剂
 
@@ -303,6 +326,10 @@ class LodgingSystem:
                 raise PermissionError("只能调剂本人占房")
             if actor.role != "applicant" and not actor.can_access_hotel(to_hotel_code):
                 raise PermissionError("无权操作目标酒店")
+            if getattr(src, "provisional", False):
+                raise WaitlistStateError(
+                    "候补暂时性占房尚未确认，不能调剂；请先确认或拒绝保留方案",
+                    offer_id=src.offer_id)
             if any(t.status == TICKET_OPEN for t in self._tickets_for(src.id)):
                 raise ValidationError("存在未裁决工单，不能调剂")
             on = parse_date(on_date)
@@ -404,8 +431,14 @@ class LodgingSystem:
                 raise
             self.allocations[dst.id] = dst
             self._trim_span(src)
-            return {"closed_partial": src.id, "released": released,
-                    "new_allocation": dst, "late_nights_ticket": created_ticket.id if created_ticket else None}
+            result = {"closed_partial": src.id, "released": released,
+                      "new_allocation": dst,
+                      "late_nights_ticket": created_ticket.id if created_ticket else None}
+            if released:
+                # 旧店释放夜 → 房态恢复，仅推进接受旧店的候补
+                result["waitlist"] = self.advance_waitlist(
+                    hotel_code=src.hotel_code)
+            return result
 
     # ------------------------------------------------------- 入住事件与离线补传
 
@@ -489,6 +522,14 @@ class LodgingSystem:
             self._pend_event(event, None, REVIEW_UNKNOWN_EVENT, hotel_code,
                              "补传事件找不到有效占房，已转人工复核")
             raise ReviewRequiredError("事件无对应占房", REVIEW_UNKNOWN_EVENT, event.ticket_id)
+        if getattr(alloc, "provisional", False):
+            # 候补暂时性保留期内尚无确认占房：不允许办理入住/开门，矛盾转人工
+            self._pend_event(
+                event, alloc.id, REVIEW_EVENT_CONFLICT, alloc.hotel_code,
+                "床位处于候补暂时保留期，尚无确认占房，事件暂挂起",
+                {"waitlist_entry_id": alloc.waitlist_entry_id})
+            raise ReviewRequiredError("候补保留期内收到事件",
+                                      REVIEW_EVENT_CONFLICT, event.ticket_id)
         event.allocation_id = alloc.id
         event.applicant_id = alloc.applicant_id
 
@@ -636,6 +677,9 @@ class LodgingSystem:
         event.status = "applied"
         result = {"event_id": event.event_id, "status": "applied",
                   "stayed": stayed, "released": released, "frozen": sorted(frozen)}
+        if released:
+            # 退房释放未来夜 → 房态恢复，同锁内推进候补（恰好一位晋位）
+            result["waitlist"] = self.advance_waitlist()
         if frozen:
             ticket = self._open_ticket(
                 REVIEW_UNCLOSED_LEAVE, alloc.id,
@@ -670,6 +714,9 @@ class LodgingSystem:
         with self.lock:
             for alloc in list(self.allocations.values()):
                 if alloc.check_out_at:
+                    continue
+                # 候补暂时性占房由候补保留期限管理，不参与爽约/超期巡检
+                if getattr(alloc, "provisional", False):
                     continue
 
                 # 1) 爽约：过了起始日仍无入住，冻结未使用夜（不释放，防止二次售出后无法裁决）
@@ -768,6 +815,9 @@ class LodgingSystem:
         with self.lock:
             alloc = self._load_alloc(allocation_id)
             self._require_owner_or_staff(actor, alloc)
+            if getattr(alloc, "provisional", False):
+                raise WaitlistStateError(
+                    "候补暂时性占房尚未确认，不能申请紧急延住", offer_id=alloc.offer_id)
             if not reason:
                 raise ValidationError("紧急延住必须说明原因")
             pol = self.policies.get(alloc.policy_code)
@@ -809,6 +859,10 @@ class LodgingSystem:
             handler(ticket, app, alloc, decision, note, billable)
             if app:
                 self._refresh_app_status(app)
+            # 爽约认定/超期驳回/离店争议驳回会释放冻结夜 → 房态恢复，顺延候补
+            if alloc is not None and ticket.type in (
+                    REVIEW_NO_SHOW, REVIEW_OVERSTAY, REVIEW_UNCLOSED_LEAVE):
+                self.advance_waitlist(hotel_code=alloc.hotel_code)
             return ticket
 
     def _decide_eligibility_appeal(self, ticket, app, alloc, decision, note, billable):
@@ -984,6 +1038,10 @@ class LodgingSystem:
         self._require_role(actor, "finance", "duty_manager")
         with self.lock:
             alloc = self._load_alloc(allocation_id)
+            if getattr(alloc, "provisional", False):
+                raise WaitlistStateError(
+                    "候补暂时性占房尚未确认，不能清算",
+                    offer_id=alloc.offer_id, allocation_id=alloc.id)
             if alloc.settlement_id:
                 return self.settlements[alloc.settlement_id]
             open_tickets = [t for t in self._tickets_for(alloc.id)
@@ -1017,6 +1075,572 @@ class LodgingSystem:
             self.settlements[settlement.id] = settlement
             alloc.settlement_id = settlement.id
             return settlement
+
+    # ================================================================== 候补
+
+    def register_waitlist(self, actor: Actor, app_id, start, end, hotels,
+                          latest_confirm_at=None, hold_minutes=None, bed_key=None,
+                          note=""):
+        """登记候补：固化资格决定时间、紧急程度、申请顺序，形成可解释队列。
+
+        登记即校验"候补不得与既有住宿、申诉冻结或服务工单冲突"，并预算权益；
+        不满足则拒绝入队，绝不先入队再在晋位时静默跳过。
+        """
+        with self.lock:
+            app = self._load_app(app_id)
+            self._require_role(actor, "applicant", "verifier", "duty_manager")
+            if actor.role == "applicant" and actor.id != app.applicant_id:
+                raise PermissionError("只能为本人登记候补")
+            if app.status != APP_ELIGIBLE:
+                raise WaitlistConflictError("申请尚未通过资格核验，不能候补",
+                                            status=app.status)
+            sd, ed = parse_date(start), parse_date(end)
+            if ed < sd:
+                raise ValidationError("结束日期早于开始日期")
+            if sd < self._now().date():
+                raise ValidationError("候补起始日期不能早于今天",
+                                      start=iso(sd), today=iso(self._now().date()))
+            dates = list(daterange(sd, ed))
+
+            hotel_codes = self._normalize_waitlist_hotels(hotels)
+            now = self._now()
+            latest_dt = self._resolve_latest_confirm(
+                latest_confirm_at, hold_minutes, now)
+
+            # 冲突闸门：既有住宿 / 申诉冻结 / 挂起工单 / 权益不足
+            self._assert_no_waitlist_conflict(app, dates)
+
+            self._waitlist_seq += 1
+            seq = self._waitlist_seq
+            basis = self._rank_basis(app, dates, hotel_codes, now, seq)
+            entry = WaitlistEntry(
+                id=_new_id("wl"), app_id=app.id, applicant_id=app.applicant_id,
+                start=iso(sd), end=iso(ed), hotels=hotel_codes,
+                registered_at=now.isoformat(),
+                latest_confirm_at=latest_dt.isoformat(),
+                rank_basis=basis, bed_key=bed_key, note=note)
+            entry.history.append({"at": now.isoformat(), "event": "registered",
+                                  "detail": {"seq": seq,
+                                             "hotels": hotel_codes,
+                                             "latest_confirm_at": latest_dt.isoformat()}})
+            self.waitlist[entry.id] = entry
+            return entry
+
+    def _normalize_waitlist_hotels(self, hotels):
+        if not hotels:
+            raise ValidationError("候补至少要指定一家可接受酒店")
+        if isinstance(hotels, str):
+            hotels = [hotels]
+        codes, seen = [], set()
+        for code in hotels:
+            code = str(code).strip()
+            if not code or code in seen:
+                continue
+            self.directory.get(code)  # 不存在即 NOT_FOUND
+            codes.append(code)
+            seen.add(code)
+        if not codes:
+            raise ValidationError("候补至少要指定一家可接受酒店")
+        return codes
+
+    def _resolve_latest_confirm(self, latest_confirm_at, hold_minutes, now):
+        if latest_confirm_at is not None:
+            latest = parse_dt(latest_confirm_at)
+            if latest <= now:
+                raise ValidationError("最晚确认时间必须晚于当前时间")
+            return latest
+        minutes = int(hold_minutes or OFFER_HOLD_MINUTES)
+        if minutes <= 0:
+            raise ValidationError("保留时长必须为正")
+        return now + timedelta(minutes=minutes)
+
+    def _assert_no_waitlist_conflict(self, app, dates, exclude_entry_id=None):
+        """候补与既有住宿、申诉冻结、未决工单、权益额度、其他活跃候补互斥检查。"""
+        conflicts = []
+        blocking_ticket = None
+        for alloc in self._applicant_allocations(app.applicant_id):
+            for d in dates:
+                day = iso(d)
+                line = alloc.nights.get(day)
+                if line is None:
+                    continue
+                if line.state in OCCUPYING:
+                    conflicts.append({"date": day, "allocation_id": alloc.id,
+                                      "state": line.state})
+                if line.state == NIGHT_BLOCKED:
+                    blocking_ticket = "frozen_night"
+            if any(t.status == TICKET_OPEN for t in self._tickets_for(alloc.id)):
+                blocking_ticket = "open_ticket"
+        # 申请本身的资格申诉工单
+        for tid in app.tickets:
+            if self.tickets.get(tid) and self.tickets[tid].status == TICKET_OPEN:
+                blocking_ticket = "open_ticket"
+        # 不得与本人其他活跃候补（含暂时保留）日期重叠，防止重复占用补贴天数
+        date_set = {iso(d) for d in dates}
+        for other in self.waitlist.values():
+            if other.id == exclude_entry_id or other.applicant_id != app.applicant_id \
+                    or not other.active():
+                continue
+            other_days = {iso(x) for x in
+                          daterange(parse_date(other.start), parse_date(other.end))}
+            overlap = sorted(date_set & other_days)
+            if overlap:
+                raise WaitlistConflictError(
+                    "与本人另一条活跃候补日期重叠，请勿重复登记",
+                    waitlist_entry_id=other.id, conflicts=overlap[:10])
+        if conflicts:
+            raise WaitlistConflictError(
+                "候补日期与既有住宿重叠，请勿重复占用；需要续住请使用调剂或延住",
+                conflicts=conflicts[:10])
+        if blocking_ticket:
+            raise WaitlistConflictError(
+                "存在申诉冻结夜或未裁决工单，处理完毕后才能候补",
+                reason=blocking_ticket)
+        # 服务工单（诉求）处于处理中时不阻塞候补，但已占用额度仍要够
+        ent = self.entitlement(app.applicant_id)
+        if len(dates) > ent["remaining_nights"]:
+            raise QuotaError(
+                "候补夜数超出剩余免费住宿权益",
+                max_free_nights=ent["max_free_nights"],
+                used_nights=ent["used_nights"],
+                request_nights=len(dates),
+                remaining_nights=ent["remaining_nights"])
+
+    def _rank_basis(self, app, dates, hotel_codes, now, seq):
+        """固化排序解释。排序键：紧急程度（大在前）→ 资格决定时间（早在前）
+        → 申请顺序（序号小在前）。资格经申诉通过的，决定时间取申诉通过时刻。"""
+        pol = self.policies.get(app.policy_code)
+        days_to_start = (dates[0] - now.date()).days
+        urgency = self._urgency_level(days_to_start)
+        decided_on, decided_via = app.submitted_on, "submission"
+        for tid in app.tickets:
+            t = self.tickets.get(tid)
+            if t and t.type == REVIEW_ELIGIBILITY_APPEAL and t.status == TICKET_APPROVED:
+                decided_on = (t.decided_at or app.submitted_on)
+                if isinstance(decided_on, str):
+                    decided_on = decided_on[:10]
+                decided_via = "appeal_approved"
+        return {
+            "seq": seq,
+            "application_id": app.id,
+            "applicant_id": app.applicant_id,
+            "submitted_on": app.submitted_on,
+            "eligibility_policy": app.policy_code,
+            "decided_on": decided_on,
+            "decided_via": decided_via,
+            "nights": len(dates),
+            "start": iso(dates[0]),
+            "end": iso(dates[-1]),
+            "days_to_start_at_registration": days_to_start,
+            "urgency": urgency["level"],
+            "urgency_score": urgency["score"],
+            "hotels": list(hotel_codes),
+            "order_rule": ["urgency_score desc", "decided_on asc", "seq asc"],
+            "frozen_at": now.isoformat(),
+        }
+
+    def _urgency_level(self, days_to_start):
+        # 0~1 天入住：紧急；2~3 天：较急；其余常规。分值仅用于排序。
+        if days_to_start <= 1:
+            return {"level": "urgent", "score": 3}
+        if days_to_start <= 3:
+            return {"level": "soon", "score": 2}
+        return {"level": "normal", "score": 1}
+
+    def _rank_key(self, entry):
+        b = entry.rank_basis
+        return (-int(b["urgency_score"]), b["decided_on"], int(b["seq"]))
+
+    # ----------------------------------------------------- 队列推进（晋位匹配）
+
+    def advance_waitlist(self, actor=None, hotel_code=None, on_date=None,
+                         limit=1):
+        """房态恢复后推进队列：按可解释顺序只为"当前可匹配"的队首生成方案。
+
+        默认每次房态恢复只暂时保留一个匹配方案（limit=1）；该方案确认、超时或
+        拒绝原子释放床位后会再推动下一位。每个活跃条目同一时刻至多一个未决
+        offer。所有写操作都在系统锁内，因此并发退订只会让释放事务各自恰好晋位
+        一位，且晋位顺序由固化排序键唯一确定。
+        """
+        if actor is not None:
+            self._require_role(actor, "verifier", "duty_manager")
+        with self.lock:
+            now = self._now()
+            # 先让已到期的保留方案原子释放，腾出床位再晋位
+            self._expire_due_offers(now)
+            scan_day = iso(parse_date(on_date or now.date()))
+            active = sorted((e for e in self.waitlist.values() if e.status == WL_WAITING),
+                            key=self._rank_key)
+            offered = []
+            for entry in active:
+                if limit is not None and len(offered) >= limit:
+                    break
+                if hotel_code and hotel_code not in entry.hotels:
+                    continue
+                offer = self._try_match(entry, scan_day, now)
+                if offer is not None:
+                    offered.append(offer)
+            return {"advanced_at": now.isoformat(), "date": scan_day,
+                    "offers": [self._offer_ref(o) for o in offered]}
+
+    def _try_match(self, entry, scan_day, now):
+        dates = list(daterange(parse_date(entry.start), parse_date(entry.end)))
+        # 再次冲突闸门：登记后可能新增占房/工单/冻结
+        app = self.applications.get(entry.app_id)
+        try:
+            self._assert_no_waitlist_conflict(app, dates, exclude_entry_id=entry.id)
+        except DomainError:
+            # 不静默丢弃：标记 blocked 并出队，留待人工/申请人处理
+            self._mark_blocked(entry, now)
+            return None
+        # 已过最晚确认时间的条目不可能再被有效确认
+        if now >= parse_dt(entry.latest_confirm_at):
+            self._finalize_entry(entry, WL_EXPIRED, now,
+                                 "超过最晚确认时间，房态恢复时已失效")
+            return None
+
+        for code in entry.hotels:
+            hotel = self.directory.get(code)
+            chosen = self._find_waitlist_bed(hotel, dates, entry.bed_key)
+            if chosen is None:
+                continue
+            return self._create_offer(entry, hotel, chosen.key, dates, now)
+        return None
+
+    def _find_waitlist_bed(self, hotel, dates, preferred_key=None):
+        candidates = [b for b in hotel.beds if b.status != BED_BLOCKED]
+        if preferred_key:
+            wanted = next((b for b in candidates if b.key == preferred_key), None)
+            if wanted is not None and self._bed_available(hotel.code, wanted.key, dates):
+                return wanted
+        for b in candidates:
+            if self._bed_available(hotel.code, b.key, dates):
+                return b
+        return None
+
+    def _create_offer(self, entry, hotel, bed_key, dates, now):
+        """原子生成暂时性占房 + offer。保留期同时不突破申请人最晚确认时间。"""
+        pol = self.policies.get(entry.rank_basis["eligibility_policy"])
+        deadline = min(now + timedelta(minutes=OFFER_HOLD_MINUTES),
+                       parse_dt(entry.latest_confirm_at))
+        alloc = Allocation(
+            id=_new_id("alloc"), app_id=entry.app_id,
+            applicant_id=entry.applicant_id, hotel_code=hotel.code,
+            bed_key=bed_key, start=iso(dates[0]), end=iso(dates[-1]),
+            planned_end=iso(dates[-1]), policy_code=pol.code,
+            chain_id=_new_id("chain"), created_from="waitlist_offer",
+            created_at=now.isoformat(), provisional=True,
+            waitlist_entry_id=entry.id)
+        self._populate_nights(alloc, hotel, dates, pol)  # 同锁内原子占位
+        self.allocations[alloc.id] = alloc
+
+        offer = WaitlistOffer(
+            id=_new_id("ofr"), entry_id=entry.id,
+            applicant_id=entry.applicant_id, app_id=entry.app_id,
+            hotel_code=hotel.code, bed_key=bed_key,
+            start=iso(dates[0]), end=iso(dates[-1]),
+            allocation_id=alloc.id, created_at=now.isoformat(),
+            expires_at=deadline.isoformat())
+        self.offers[offer.id] = offer
+        entry.status = WL_OFFERED
+        entry.offered_at = now.isoformat()
+        entry.offer_expires_at = deadline.isoformat()
+        entry.offer_id = offer.id
+        entry.allocation_id = alloc.id
+        entry.history.append({
+            "at": now.isoformat(), "event": "offered",
+            "detail": {"offer_id": offer.id, "hotel_code": hotel.code,
+                       "bed_key": bed_key, "expires_at": deadline.isoformat()}})
+        alloc.offer_id = offer.id
+        alloc.offered_at = now.isoformat()
+        alloc.offer_expires_at = deadline.isoformat()
+        return offer
+
+    # ----------------------------------------------------------- 确认/超时/拒绝
+
+    def confirm_waitlist_offer(self, actor, offer_id=None, entry_id=None,
+                               request_id=None):
+        """确认暂时性占房。幂等：同一 request_id 重复确认返回同一方案，不多扣权益。"""
+        with self.lock:
+            now = self._now()
+            offer = self._resolve_offer(offer_id, entry_id)
+            entry = self.waitlist[offer.entry_id]
+            self._require_owner_or_staff_waitlist(actor, entry)
+
+            # 幂等：离线重复确认（同 request_id）→ 返回首次结果
+            if request_id is not None and request_id in self._consumed_confirm_ids:
+                prior = self._find_confirmation(request_id)
+                if prior is not None:
+                    return {"idempotent": True, "request_id": request_id,
+                            "offer": self._offer_view(prior),
+                            "allocation": self.allocations.get(prior.allocation_id)}
+
+            if offer.status == "confirmed":
+                # 无 request_id 的重复确认也必须幂等，绝不再扣权益
+                return {"idempotent": True, "request_id": offer.request_id,
+                        "offer": self._offer_view(offer),
+                        "allocation": self.allocations.get(offer.allocation_id)}
+            if offer.status != "open":
+                raise WaitlistStateError(
+                    "保留方案已结束，不能确认", status=offer.status,
+                    offer_id=offer.id)
+            if now > parse_dt(offer.expires_at):
+                # 懒超时：确认到达时已过保留期，先原子释放再拒绝
+                self._expire_offer(offer, now)
+                raise WaitlistStateError(
+                    "已超过保留期限，床位已释放并顺延下一位",
+                    status=WL_EXPIRED, offer_id=offer.id)
+
+            alloc = self.allocations[offer.allocation_id]
+            offer.status = "confirmed"
+            offer.decided_at = now.isoformat()
+            offer.decision_note = "申请人确认"
+            offer.request_id = request_id
+            if request_id is not None:
+                self._consumed_confirm_ids.add(request_id)
+            alloc.provisional = False
+            alloc.confirmed_at = now.isoformat()
+            self._finalize_entry(entry, WL_CONFIRMED, now, "申请人确认保留方案")
+            entry.history.append({"at": now.isoformat(), "event": "confirmed",
+                                  "detail": {"request_id": request_id,
+                                             "allocation_id": alloc.id}})
+            return {"idempotent": False, "request_id": request_id,
+                    "offer": self._offer_view(offer), "allocation": alloc}
+
+    def reject_waitlist_offer(self, actor, offer_id=None, entry_id=None,
+                              note="申请人拒绝"):
+        with self.lock:
+            now = self._now()
+            offer = self._resolve_offer(offer_id, entry_id)
+            entry = self.waitlist[offer.entry_id]
+            self._require_owner_or_staff_waitlist(actor, entry)
+            if offer.status == "rejected":
+                return {"idempotent": True, "offer": self._offer_view(offer)}
+            if offer.status != "open":
+                raise WaitlistStateError("保留方案已结束，不能拒绝",
+                                         status=offer.status, offer_id=offer.id)
+            self._release_offer(offer, "rejected", now, note)
+            self._finalize_entry(entry, WL_REJECTED, now, note)
+            # 释放后立即尝试顺延下一位（同锁，顺序确定）
+            followup = self.advance_waitlist(hotel_code=offer.hotel_code)
+            return {"offer": self._offer_view(offer), "advanced": followup}
+
+    def cancel_waitlist(self, actor, entry_id, note="申请人撤下"):
+        with self.lock:
+            now = self._now()
+            entry = self.waitlist.get(entry_id)
+            if entry is None:
+                raise NotFoundError("候补条目不存在", entry_id=entry_id)
+            self._require_owner_or_staff_waitlist(actor, entry)
+            if entry.status in (WL_CANCELLED,):
+                return {"idempotent": True, "entry": self._entry_view(entry)}
+            if entry.status not in WL_ACTIVE:
+                raise WaitlistStateError("候补条目已结束，不能撤下",
+                                         status=entry.status, entry_id=entry_id)
+            if entry.status == WL_OFFERED and entry.offer_id:
+                offer = self.offers[entry.offer_id]
+                if offer.status == "open":
+                    self._release_offer(offer, "cancelled", now, note)
+            self._finalize_entry(entry, WL_CANCELLED, now, note)
+            followup = self.advance_waitlist()
+            return {"entry": self._entry_view(entry), "advanced": followup}
+
+    def expire_waitlist(self, actor=None, offer_id=None):
+        """超时扫描/单条超时：原子释放床位并顺延下一位。"""
+        if actor is not None:
+            self._require_role(actor, "verifier", "duty_manager")
+        with self.lock:
+            now = self._now()
+            if offer_id:
+                offer = self.offers.get(offer_id)
+                if offer is None:
+                    raise NotFoundError("保留方案不存在", offer_id=offer_id)
+                if offer.status != "open":
+                    return {"idempotent": True, "offer": self._offer_view(offer)}
+                freed = self._offer_ref(offer) if offer.status == "open" else None
+                self._expire_offer(offer, now)
+                followup = self.advance_waitlist(hotel_code=offer.hotel_code)
+                return {"expired": [freed] if freed else [], "advanced": followup}
+            expired = self._expire_due_offers(now)
+            advanced = self.advance_waitlist() if expired else None
+            return {"expired": [self._offer_ref(self.offers[o]) for o in expired],
+                    "advanced": advanced}
+
+    def _expire_due_offers(self, now):
+        due = [o for o in self.offers.values()
+               if o.status == "open" and now >= parse_dt(o.expires_at)]
+        ids = []
+        for offer in due:
+            self._expire_offer(offer, now)
+            ids.append(offer.id)
+        return ids
+
+    def _expire_offer(self, offer, now):
+        if offer.status != "open":
+            return
+        self._release_offer(offer, "expired", now, "超过保留期限未确认")
+        entry = self.waitlist.get(offer.entry_id)
+        if entry and entry.status == WL_OFFERED:
+            self._finalize_entry(entry, WL_EXPIRED, now, "超过保留期限未确认")
+
+    def _release_offer(self, offer, outcome, now, note):
+        """原子释放暂时性占房：床位索引 + 人员索引 + 权益（随索引释放）。"""
+        alloc = self.allocations.get(offer.allocation_id)
+        if alloc is not None and alloc.provisional:
+            for day, line in list(alloc.nights.items()):
+                if line.state in OCCUPYING:
+                    line.state = NIGHT_RELEASED
+                    self._release_indices(alloc, day)
+            self._trim_span(alloc)
+        offer.status = outcome
+        offer.decided_at = now.isoformat()
+        offer.decision_note = note
+
+    def _finalize_entry(self, entry, decision, now, note):
+        entry.status = decision
+        entry.decided_at = now.isoformat()
+        entry.decision = decision
+        entry.history.append({"at": now.isoformat(), "event": decision,
+                              "detail": {"note": note}})
+
+    def _mark_blocked(self, entry, now):
+        entry.status = WL_BLOCKED
+        entry.decided_at = now.isoformat()
+        entry.decision = WL_BLOCKED
+        entry.history.append({"at": now.isoformat(), "event": WL_BLOCKED,
+                              "detail": {"note": "匹配时发现新冲突，移出队列待处理"}})
+
+    # ------------------------------------------------------------------ 视图
+
+    def waitlist_queue(self, actor, hotel_code=None, status=WL_WAITING,
+                       include_offered=True):
+        """工作人员队列视图：含序号、紧急程度、排序解释与当前保留状态。"""
+        self._require_role(actor, "verifier", "duty_manager", "service_officer")
+        with self.lock:
+            statuses = {status}
+            if include_offered and status == WL_WAITING:
+                statuses.add(WL_OFFERED)
+            rows = [e for e in self.waitlist.values() if e.status in statuses]
+            if hotel_code:
+                rows = [e for e in rows if hotel_code in e.hotels]
+            rows.sort(key=self._rank_key)
+            return {"as_of": self._now().isoformat(),
+                    "order_rule": ["urgency_score desc", "decided_on asc", "seq asc"],
+                    "entries": [self._entry_view(e, position=i + 1)
+                                for i, e in enumerate(rows)]}
+
+    def applicant_waitlist(self, actor, app_id=None, applicant_id=None):
+        """申请人视图：本人候补的状态、队位、保留方案与剩余确认时间。"""
+        with self.lock:
+            if app_id:
+                app = self._load_app(app_id)
+                target = app.applicant_id
+            else:
+                target = applicant_id or actor.id
+            if actor.role == "applicant" and actor.id != target:
+                raise PermissionError("只能查看本人候补")
+            rows = [e for e in self.waitlist.values()
+                    if e.applicant_id == target and e.active()]
+            rows.sort(key=self._rank_key)
+            result = []
+            for e in rows:
+                view = self._entry_view(e)
+                # 队位：在同等"等待"队列中的位置（不含更靠后的人）
+                view["position"] = self._position_of(e)
+                view["offer"] = None
+                view["seconds_to_deadline"] = None
+                if e.status == WL_OFFERED and e.offer_id:
+                    view["offer"] = self._offer_view(self.offers[e.offer_id])
+                    view["seconds_to_deadline"] = self._seconds_to(
+                        self.offers[e.offer_id].expires_at)
+                result.append(view)
+            return {"as_of": self._now().isoformat(), "entries": result}
+
+    def get_waitlist_entry(self, entry_id):
+        entry = self.waitlist.get(entry_id)
+        if entry is None:
+            raise NotFoundError("候补条目不存在", entry_id=entry_id)
+        return entry
+
+    def _position_of(self, entry):
+        if entry.status != WL_WAITING:
+            return None
+        ahead = [e for e in self.waitlist.values()
+                 if e.status == WL_WAITING and self._rank_key(e) < self._rank_key(entry)]
+        return len(ahead) + 1
+
+    def _seconds_to(self, iso_dt):
+        delta = parse_dt(iso_dt) - self._now()
+        return max(0, int(delta.total_seconds()))
+
+    # ------------------------------------------------------------------ 序列化辅助
+
+    def _resolve_offer(self, offer_id, entry_id):
+        if offer_id:
+            offer = self.offers.get(offer_id)
+            if offer is None:
+                raise NotFoundError("保留方案不存在", offer_id=offer_id)
+            return offer
+        if entry_id:
+            entry = self.waitlist.get(entry_id)
+            if entry is None:
+                raise NotFoundError("候补条目不存在", entry_id=entry_id)
+            if not entry.offer_id:
+                raise WaitlistStateError("该候补尚未生成保留方案",
+                                         status=entry.status, entry_id=entry_id)
+            return self.offers[entry.offer_id]
+        raise ValidationError("必须提供 offer_id 或 entry_id")
+
+    def _find_confirmation(self, request_id):
+        return next((o for o in self.offers.values()
+                     if o.request_id == request_id and o.status == "confirmed"), None)
+
+    def _require_owner_or_staff_waitlist(self, actor, entry):
+        if actor.role == "applicant":
+            if actor.id != entry.applicant_id:
+                raise PermissionError("只能操作本人候补")
+        elif actor.role not in ("verifier", "duty_manager"):
+            raise PermissionError("无权操作候补", role=actor.role)
+
+    def _offer_ref(self, offer):
+        return {"offer_id": offer.id, "entry_id": offer.entry_id,
+                "hotel_code": offer.hotel_code, "bed_key": offer.bed_key,
+                "start": offer.start, "end": offer.end,
+                "expires_at": offer.expires_at, "status": offer.status}
+
+    def _offer_view(self, offer):
+        out = self._offer_ref(offer)
+        out.update({"allocation_id": offer.allocation_id,
+                    "created_at": offer.created_at,
+                    "decided_at": offer.decided_at,
+                    "request_id": offer.request_id,
+                    "decision_note": offer.decision_note,
+                    "applicant_id": offer.applicant_id})
+        return out
+
+    def _entry_view(self, entry, position=None):
+        return {
+            "id": entry.id,
+            "app_id": entry.app_id,
+            "applicant_id": entry.applicant_id,
+            "start": entry.start,
+            "end": entry.end,
+            "hotels": list(entry.hotels),
+            "status": entry.status,
+            "position": position,
+            "registered_at": entry.registered_at,
+            "latest_confirm_at": entry.latest_confirm_at,
+            "rank_basis": dict(entry.rank_basis),
+            "bed_key": entry.bed_key,
+            "note": entry.note,
+            "offered_at": entry.offered_at,
+            "offer_expires_at": entry.offer_expires_at,
+            "offer_id": entry.offer_id,
+            "allocation_id": entry.allocation_id,
+            "decided_at": entry.decided_at,
+            "decision": entry.decision,
+            "history": list(entry.history),
+        }
 
     # ------------------------------------------------------------- 服务诉求
 

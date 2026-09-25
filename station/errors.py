@@ -59,6 +59,20 @@ class BookingConflictError(DomainError):
     http_status = 409
 
 
+class WaitlistConflictError(DomainError):
+    """候补与既有住宿、申诉冻结或服务工单冲突，不允许入队/晋位。"""
+
+    code = "WAITLIST_CONFLICT"
+    http_status = 409
+
+
+class WaitlistStateError(DomainError):
+    """候补条目/保留方案当前状态不允许该操作（重复确认、已终局等）。"""
+
+    code = "WAITLIST_STATE"
+    http_status = 409
+
+
 class NotFoundError(DomainError):
     code = "NOT_FOUND"
     http_status = 404
